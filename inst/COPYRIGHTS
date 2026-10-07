@@ -1,0 +1,89 @@
+COPYRIGHTS
+==========
+
+The zuyaml R package as a whole
+------------------------------
+
+  Copyright (c) 2026 Pedro Baltazar
+
+  Released under the MIT License. See the LICENSE file for the copyright
+  holder and year, and LICENSE.md for the full license text.
+
+
+Bundled third-party code: cyaml
+-------------------------------
+
+  Files:    src/cyaml.c, src/cyaml.h, src/cyaml_emitter.c,
+            src/cyaml_events.c, src/cyaml_internal.h, src/cyaml_json.c,
+            src/cyaml_modify.c, src/cyaml_parser.c, src/cyaml_path.c,
+            src/cyaml_utf8.c, src/cyaml_utf8.h
+
+  Upstream: https://github.com/andrewmd5/cyaml
+  Version:  v0.1.3
+  Commit:   0672e81b809bc3dfd1d4f57ba0fcfbb20c60ae70
+
+  Copyright (c) 2025 Andrew Sampson
+
+  Released under the MIT License, reproduced in full below.
+
+  Modifications made when bundling are limited to the minimum required for
+  compatibility with R, are individually documented, and are recorded in
+  inst/cyaml-VERSION. As of the version noted above these are:
+
+    - src/cyaml_internal.h: the CYAML_ASSERT and CYAML_UNREACHABLE macros
+      are redirected from fprintf(stderr, ...) + abort() to an R error
+      condition, because CRAN policy prohibits compiled code that aborts
+      the process or writes to stderr.
+
+    - src/cyaml_emitter.c: emit_scalar() no longer promotes a plain scalar
+      spelled null/true/false/~ to double-quoted. Upstream, that promotion
+      makes a boolean built with cyaml_new_bool() emit as the string
+      "true". zuyaml selects scalar styles before building, so the
+      decision has already been made by the caller.
+
+    - src/cyaml.c: cyaml_doc_append() no longer calls memcpy() when there
+      is nothing to copy. Appending zero bytes to a document whose buffer
+      has not been allocated yet passes a NULL destination to memcpy(),
+      which is undefined behaviour; UndefinedBehaviorSanitizer reports it.
+
+    - src/cyaml_utf8.c: cyaml_str_to_i64() no longer negates INT64_MIN in
+      int64_t. The magnitude of INT64_MIN is admitted by the bound check
+      but its negation overflows, which is undefined behaviour;
+      UndefinedBehaviorSanitizer reports it on the ordinary literal
+      -9223372036854775808.
+
+    - src/cyaml.c: cyaml_scalar_str() returns the span verbatim for a
+      document that was built rather than parsed. The processing it
+      otherwise applies -- folding line breaks into spaces, dropping
+      whitespace before a break, decoding quote and escape sequences --
+      reads the span as YAML source, which is right for a parsed document
+      and wrong for a built one, where the span is the literal string the
+      caller supplied. Without this, any string containing a line break
+      was corrupted on emit.
+
+  No other upstream source file is modified. Upstream files are otherwise
+  bundled verbatim.
+
+  ---------------------------------------------------------------------
+
+  MIT License
+
+  Copyright (c) 2025 Andrew Sampson
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.

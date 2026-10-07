@@ -1,0 +1,1101 @@
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "zuyaml.h"
+
+/* Largest integer exactly representable as an IEEE-754 double. */
+#define ZUYAML_MAX_EXACT_DOUBLE 9007199254740992.0
+
+static bool all_digits(const char* s, size_t n)
+{
+    size_t i;
+
+    if (n == 0) {
+        return false;
+    }
+    for (i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+_Noreturn static void stop_embedded_nul(const cyaml_node_t* node)
+{
+    zuyaml_stopf_at("embedded_nul", NULL, &node->span,
+        "YAML scalar at line %u, column %u contains an embedded NUL byte, "
+        "which cannot be represented as an R string.",
+        (unsigned)node->span.start_line, (unsigned)node->span.start_col);
+}
+
+/*
+ * R character strings cannot contain an embedded NUL, and Rf_mkCharLenCE()
+ * raises an error if handed one -- which is an unwind. Detect it first so we
+ * can free any C allocation and raise a proper condition instead.
+ *
+ * A *literal* NUL in the input is refused before the parser runs
+ * (check_input_nul() in zuyaml_parse.c), because cyaml would have truncated
+ * the document at it. What can still arrive here is a NUL the parser produced:
+ * the \0 escape below, and any future decoding path that can synthesise one.
+ * The guard is kept rather than assumed unreachable.
+ */
+static void check_no_nul(const char* s, size_t len, const cyaml_node_t* node)
+{
+    if (memchr(s, '\0', len) != NULL) {
+        stop_embedded_nul(node);
+    }
+}
+
+/*
+ * Does this double-quoted scalar contain an escape that produces a NUL?
+ *
+ * `key: "\0"` is legal YAML -- \0 is a valid double-quoted escape -- and R
+ * cannot represent the result. cyaml_scalar_str() returns a NUL-terminated
+ * string with no length, so by the time we hold its result the value has
+ * already been truncated at the NUL and the loss is undetectable. The raw
+ * source span has to be scanned instead, before the value is used.
+ *
+ * Only CYAML_DOUBLE needs this: plain, single-quoted, literal and folded
+ * scalars have no escape that can produce a NUL.
+ */
+static bool has_nul_escape(const char* p, size_t n)
+{
+    size_t i = 0;
+
+    while (i < n) {
+        if (p[i] != '\\') {
+            i++;
+            continue;
+        }
+        i++; /* consume the backslash */
+        if (i >= n) {
+            break;
+        }
+        switch (p[i]) {
+        case '0':
+            return true;
+        case 'x':
+            if (i + 2 < n && memcmp(p + i + 1, "00", 2) == 0) {
+                return true;
+            }
+            i += 3;
+            break;
+        case 'u':
+            if (i + 4 < n && memcmp(p + i + 1, "0000", 4) == 0) {
+                return true;
+            }
+            i += 5;
+            break;
+        case 'U':
+            if (i + 8 < n && memcmp(p + i + 1, "00000000", 8) == 0) {
+                return true;
+            }
+            i += 9;
+            break;
+        default:
+            /* \\ , \" , \n and friends: consume the escaped character so a
+               literal backslash is never mistaken for an escape opener. */
+            i++;
+            break;
+        }
+    }
+    return false;
+}
+
+/*
+ * Convert a scalar node's text to an R character vector.
+ *
+ * Single-line plain scalars take the zero-copy path: cyaml_str()/cyaml_len()
+ * point straight into the source buffer, so the text goes to
+ * Rf_mkCharLenCE() with no intermediate allocation. Since such scalars
+ * dominate real documents, this removes most of the per-scalar malloc/free
+ * traffic.
+ *
+ * Everything else goes through cyaml_scalar_str(), which mallocs and must be
+ * freed, but applies the processing the value needs.
+ *
+ * The line check is essential, not an optimisation detail. A *plain* scalar
+ * may still span several lines, and YAML folds those breaks into spaces:
+ *
+ *     plain: This unquoted scalar
+ *       spans two lines
+ *
+ * is the single value "This unquoted scalar spans two lines". Taking the raw
+ * span there returns the newline and the indentation verbatim. Plain scalars
+ * have no escapes, so a span with no line break needs no processing at all --
+ * but one with a break needs folding.
+ */
+static bool spans_lines(const char* p, uint32_t n)
+{
+    /* memchr is declared nonnull, so an empty span must not reach it. */
+    if (p == NULL || n == 0) {
+        return false;
+    }
+    return memchr(p, '\n', (size_t)n) != NULL
+        || memchr(p, '\r', (size_t)n) != NULL;
+}
+
+static SEXP scalar_charsxp(const cyaml_doc_t* doc, const cyaml_node_t* node)
+{
+    const char* raw = cyaml_str(doc, node);
+    uint32_t raw_n = cyaml_len(node);
+
+    if (node->style == CYAML_PLAIN && !spans_lines(raw, raw_n)) {
+        if (raw == NULL || raw_n == 0) {
+            return Rf_mkCharLenCE("", 0, CE_UTF8);
+        }
+        check_no_nul(raw, (size_t)raw_n, node);
+        return Rf_mkCharLenCE(raw, (int)raw_n, CE_UTF8);
+    }
+
+    /* Check the raw span before decoding: cyaml_scalar_str() would truncate
+       a NUL-producing escape without telling us. */
+    {
+        if (raw != NULL && raw_n > 0) {
+            check_no_nul(raw, (size_t)raw_n, node);
+            if (node->style == CYAML_DOUBLE
+                && has_nul_escape(raw, (size_t)raw_n)) {
+                stop_embedded_nul(node);
+            }
+        }
+    }
+
+    {
+        char* s = cyaml_scalar_str(doc, node);
+        SEXP out;
+
+        if (s == NULL) {
+            return Rf_mkCharLenCE("", 0, CE_UTF8);
+        }
+
+        /* The C string must not be live across an allocating R call that
+           could unwind, so it is copied into a CHARSXP and freed at once. */
+        out = PROTECT(Rf_mkCharLenCE(s, (int)strlen(s), CE_UTF8));
+        free(s);
+        UNPROTECT(1);
+        return out;
+    }
+}
+
+static SEXP scalar_string(const cyaml_doc_t* doc, const cyaml_node_t* node)
+{
+    SEXP ch = PROTECT(scalar_charsxp(doc, node));
+    SEXP out = Rf_ScalarString(ch);
+    UNPROTECT(1);
+    return out;
+}
+
+/*
+ * Build a zuyaml_bigint: a character vector carrying the *decimal*
+ * normalisation of the value.
+ *
+ * The source text is deliberately not reused. cyaml accepts 0x and 0o
+ * integers, so storing the raw span would yield "0xFFFFFFFFFFFFFFFF", which is
+ * useless for comparison and would not round-trip as an integer.
+ */
+static SEXP mk_bigint(const char* digits)
+{
+    SEXP out = PROTECT(Rf_mkString(digits));
+    SEXP cls = PROTECT(Rf_mkString("zuyaml_bigint"));
+    Rf_setAttrib(out, R_ClassSymbol, cls);
+    UNPROTECT(2);
+    return out;
+}
+
+/*
+ * Apply the big_integers policy to a value that cannot be held exactly by an R
+ * numeric type. `digits` is the decimal normalisation, `approx` the lossy
+ * double, already computed by the caller.
+ */
+static SEXP big_integer(zuyaml_ctx_t* ctx, const char* digits, double approx)
+{
+    switch (ctx->big_integers) {
+    case ZUYAML_BIGINT_DOUBLE:
+        return Rf_ScalarReal(approx);
+    case ZUYAML_BIGINT_ERROR:
+        zuyaml_stopf("precision", NULL,
+            "Integer %s cannot be represented exactly by an R numeric type; "
+            "set big_integers to \"bigint\" or \"double\".",
+            digits);
+    case ZUYAML_BIGINT_CLASS:
+    default:
+        return mk_bigint(digits);
+    }
+}
+
+static SEXP scalar_int(const cyaml_doc_t* doc, const cyaml_node_t* node,
+    zuyaml_ctx_t* ctx)
+{
+    char digits[32];
+    int64_t v;
+    uint64_t uv;
+
+    if (cyaml_as_int(doc, node, &v)) {
+        /* NA_INTEGER is INT_MIN, so it is not available as a value. */
+        if (v > (int64_t)INT_MIN && v <= (int64_t)INT_MAX) {
+            return Rf_ScalarInteger((int)v);
+        }
+        if (v >= -(int64_t)ZUYAML_MAX_EXACT_DOUBLE
+            && v <= (int64_t)ZUYAML_MAX_EXACT_DOUBLE) {
+            return Rf_ScalarReal((double)v);
+        }
+        snprintf(digits, sizeof(digits), "%" PRId64, v);
+        return big_integer(ctx, digits, (double)v);
+    }
+
+    /* Above INT64_MAX, cyaml_as_int fails but cyaml_as_uint may succeed. */
+    if (cyaml_as_uint(doc, node, &uv)) {
+        if (uv <= (uint64_t)ZUYAML_MAX_EXACT_DOUBLE) {
+            return Rf_ScalarReal((double)uv);
+        }
+        snprintf(digits, sizeof(digits), "%" PRIu64, uv);
+        return big_integer(ctx, digits, (double)uv);
+    }
+
+    /* Beyond uint64 entirely. Only the source text is available, so it is used
+       as-is; such a literal is decimal in practice, since hex and octal forms
+       are handled above.
+       
+       This is also reachable when an explicit !!int tag is attached to text
+       that is not an integer at all, so the text is validated rather than
+       trusted: otherwise `!!int 1 - 3` would become a zuyaml_bigint holding
+       "1 - 3". Anything that is not a decimal integer falls back to a
+       string, which is what an unresolvable scalar is. */
+    {
+        const char* raw = cyaml_str(doc, node);
+        uint32_t raw_n = cyaml_len(node);
+        uint32_t k, z;
+        bool neg;
+        size_t norm_n;
+        char* norm;
+
+        if (raw == NULL || raw_n == 0) {
+            return scalar_string(doc, node);
+        }
+        neg = (raw[0] == '-');
+        k = (neg || raw[0] == '+') ? 1u : 0u;
+        if (k >= raw_n || !all_digits(raw + k, (size_t)(raw_n - k))) {
+            return scalar_string(doc, node);
+        }
+
+        /* Normalise to the decimal form mk_bigint promises: no leading '+',
+           no leading zeros, so that +007 and 7 give identical values. The
+           text is copied rather than used in place, both because the span is
+           not NUL-terminated and because the sign may have to be dropped. */
+        z = k;
+        while (z + 1u < raw_n && raw[z] == '0') {
+            z++;
+        }
+        norm_n = (size_t)(raw_n - z) + (neg ? 1u : 0u);
+        norm = (norm_n < sizeof(digits))
+            ? digits
+            : (char*)R_alloc(norm_n + 1u, 1); /* freed when .Call returns */
+        if (neg) {
+            norm[0] = '-';
+        }
+        memcpy(norm + (neg ? 1u : 0u), raw + z, (size_t)(raw_n - z));
+        norm[norm_n] = '\0';
+
+        /* The approximation has to come from the text: the value is beyond
+           every integer type here, so there is nothing else to convert. */
+        return big_integer(ctx, norm, atof(norm));
+    }
+}
+
+/*
+ * Text that does not conform to the tag falls back to a string.
+ *
+ * Both of these are reachable two ways: from schema resolution, where cyaml
+ * has already decided the text is a float or a boolean and the conversion
+ * cannot fail, and from an explicit `!!float` / `!!bool` tag on arbitrary
+ * text, where it can. An unresolvable scalar is a string in YAML, and the
+ * `!!int` path takes the same way out, so `!!float abc` is "abc" rather than
+ * an error -- erroring would reject documents that parsed before tags were
+ * honoured at all.
+ */
+/*
+ * Convert a float that cyaml refused because the value is out of range.
+ *
+ * `cyaml_str_to_f64()` treats a non-zero `errno` as failure, and `strtod()`
+ * sets `ERANGE` for overflow, for underflow to zero, **and** for any subnormal
+ * result. So `1e309`, `1e-324` and the perfectly representable `1e-323` were
+ * all handed back as *character strings*: a field's R type depended on the
+ * magnitude of its value, which is the one thing the design's `simplify`
+ * argument says must never happen. A caller reading `timeout: 1e308` got a
+ * double and the same caller reading `timeout: 1e309` got a string.
+ *
+ * `ERANGE` is exactly the case where the answer is well defined -- C requires
+ * strtod to return the nearest representable value, so +-HUGE_VAL, zero, or
+ * the subnormal -- and it is the value R's own reader gives for the same text.
+ * Sharing that rule with `zujson`, which states it as "generous about numbers,
+ * strict about text": one absurd number should not change the type of a field,
+ * let alone invalidate a document.
+ *
+ * Text that is not a number at all still falls back to a string, which is what
+ * an unresolvable scalar is in YAML -- that is the `!!float abc` path below,
+ * and it is unaffected.
+ */
+static bool out_of_range_double(
+    const cyaml_doc_t* doc, const cyaml_node_t* node, double* out)
+{
+    const char* raw = cyaml_str(doc, node);
+    uint32_t raw_n = cyaml_len(node);
+    char stack_buf[64];
+    char* text;
+    char* endp;
+    double v;
+
+    if (raw == NULL || raw_n == 0) {
+        return false;
+    }
+    /* The span is not NUL-terminated, and strtod() needs it to be. A long one
+       is legitimate (0.000...1), so it is copied rather than bounded. */
+    text = ((size_t)raw_n < sizeof(stack_buf))
+        ? stack_buf
+        : (char*)R_alloc((size_t)raw_n + 1u, 1); /* freed when .Call returns */
+    memcpy(text, raw, (size_t)raw_n);
+    text[raw_n] = '\0';
+
+    /* R guarantees LC_NUMERIC is "C", so the decimal separator is a point.
+       zuyaml_emit.c relies on the same guarantee when formatting doubles. */
+    errno = 0;
+    v = strtod(text, &endp);
+    if (endp == text || *endp != '\0') {
+        return false; /* not a number; a string, as YAML says */
+    }
+    if (errno != 0 && errno != ERANGE) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+static SEXP scalar_double(const cyaml_doc_t* doc, const cyaml_node_t* node)
+{
+    double v;
+
+    /* Handles .inf, -.inf and .nan. */
+    if (cyaml_as_float(doc, node, &v)) {
+        return Rf_ScalarReal(v);
+    }
+    if (out_of_range_double(doc, node, &v)) {
+        return Rf_ScalarReal(v);
+    }
+    return scalar_string(doc, node);
+}
+
+static SEXP scalar_bool(const cyaml_doc_t* doc, const cyaml_node_t* node)
+{
+    bool v;
+
+    if (!cyaml_as_bool(doc, node, &v)) {
+        return scalar_string(doc, node);
+    }
+    return Rf_ScalarLogical(v ? TRUE : FALSE);
+}
+
+/*
+ * YAML tags.
+ *
+ * A tag overrides schema resolution: `!!str 12` is the string "12", not the
+ * integer 12, and the non-specific tag `!` forces string resolution too.
+ * Without this, tagged scalars were resolved as though untagged.
+ *
+ * A tag reaches us as the raw source span of the tag token, so it may be a
+ * shorthand (`!!str`, `!e!str`, `!local`), a verbatim tag
+ * (`!<tag:yaml.org,2002:str>`) or the non-specific `!`. Everything but the
+ * last is expanded against the document's %TAG directives before it is
+ * compared, so all the spellings of a core tag are recognised and a handle
+ * bound to some other prefix is not.
+ */
+typedef enum {
+    ZUYAML_TAG_NONE = 0,
+    ZUYAML_TAG_STR,
+    ZUYAML_TAG_INT,
+    ZUYAML_TAG_FLOAT,
+    ZUYAML_TAG_BOOL,
+    ZUYAML_TAG_NULL,
+    ZUYAML_TAG_COLLECTION, /* !!seq, !!map -- no effect on a scalar */
+    ZUYAML_TAG_UNKNOWN /* an application tag */
+} zuyaml_tag_t;
+
+#define ZUYAML_CORE_PREFIX "tag:yaml.org,2002:"
+#define ZUYAML_CORE_PREFIX_N (sizeof(ZUYAML_CORE_PREFIX) - 1)
+
+/*
+ * The prefix a %TAG directive binds to this handle, or the YAML default.
+ *
+ * `%TAG !! tag:example.com,2000:app/` makes `!!int` an application tag; the
+ * equally legal `%TAG !! tag:yaml.org,2002:` restates the default and changes
+ * nothing, so the prefix has to be compared, not merely the handle. A named
+ * handle with no directive is undefined, and reported as such by returning
+ * false.
+ */
+static bool handle_prefix(const cyaml_doc_t* doc, const char* handle,
+    size_t handle_n, const char** prefix, size_t* prefix_n)
+{
+    uint8_t i;
+
+    if (doc != NULL) {
+        for (i = 0; i < doc->tag_count; i++) {
+            const cyaml_span_t* h = &doc->tags[i].handle;
+            const char* text = cyaml_span_ptr(doc, *h);
+
+            if (text != NULL && (size_t)h->len == handle_n
+                && memcmp(text, handle, handle_n) == 0) {
+                *prefix = cyaml_span_ptr(doc, doc->tags[i].prefix);
+                *prefix_n = (size_t)doc->tags[i].prefix.len;
+                return *prefix != NULL;
+            }
+        }
+    }
+    if (handle_n == 1 && handle[0] == '!') {
+        *prefix = "!"; /* the primary handle names a local tag */
+        *prefix_n = 1;
+        return true;
+    }
+    if (handle_n == 2 && handle[0] == '!' && handle[1] == '!') {
+        *prefix = ZUYAML_CORE_PREFIX;
+        *prefix_n = ZUYAML_CORE_PREFIX_N;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Expand a tag into its full form, writing it into `buf`.
+ *
+ * Returns false when there is no full form -- an undefined handle, or a tag
+ * longer than the buffer, both of which the caller treats as an application
+ * tag, which is what they are as far as the core schema is concerned.
+ */
+static bool resolve_tag(const cyaml_doc_t* doc, const char* s, size_t n,
+    char* buf, size_t buf_n)
+{
+    const char *handle, *suffix, *prefix;
+    size_t handle_n, suffix_n, prefix_n, j;
+
+    if (n < 1 || s[0] != '!') {
+        return false;
+    }
+    if (n >= 3 && s[1] == '<' && s[n - 1] == '>') {
+        /* Verbatim: `!<tag:yaml.org,2002:str>` is already the full form. */
+        suffix_n = n - 3;
+        if (suffix_n >= buf_n) {
+            return false;
+        }
+        memcpy(buf, s + 2, suffix_n);
+        buf[suffix_n] = '\0';
+        return true;
+    }
+
+    /* Shorthand: the handle is `!`, `!!`, or `!name!`. */
+    for (j = 1; j < n && s[j] != '!'; j++) {
+        if (!((s[j] >= '0' && s[j] <= '9') || (s[j] >= 'A' && s[j] <= 'Z')
+                || (s[j] >= 'a' && s[j] <= 'z') || s[j] == '-')) {
+            break; /* not a handle character, so the handle is just `!` */
+        }
+    }
+    handle = s;
+    if (j < n && s[j] == '!') {
+        handle_n = j + 1;
+    } else {
+        handle_n = 1;
+    }
+    suffix = s + handle_n;
+    suffix_n = n - handle_n;
+
+    if (!handle_prefix(doc, handle, handle_n, &prefix, &prefix_n)) {
+        return false;
+    }
+    if (prefix_n + suffix_n >= buf_n) {
+        return false;
+    }
+    memcpy(buf, prefix, prefix_n);
+    memcpy(buf + prefix_n, suffix, suffix_n);
+    buf[prefix_n + suffix_n] = '\0';
+    return true;
+}
+
+static zuyaml_tag_t classify_tag(const cyaml_doc_t* doc, const char* s,
+    size_t n)
+{
+    char buf[512];
+    const char* suffix;
+
+    if (s == NULL || n == 0) {
+        return ZUYAML_TAG_NONE;
+    }
+    /* The non-specific tag `!` means "resolve as a string". It is a distinct
+       production from the primary tag handle, so a `%TAG !` directive does
+       not apply to it and this check comes first. */
+    if (n == 1 && s[0] == '!') {
+        return ZUYAML_TAG_STR;
+    }
+    if (!resolve_tag(doc, s, n, buf, sizeof(buf))) {
+        return ZUYAML_TAG_UNKNOWN;
+    }
+    if (strncmp(buf, ZUYAML_CORE_PREFIX, ZUYAML_CORE_PREFIX_N) != 0) {
+        return ZUYAML_TAG_UNKNOWN;
+    }
+
+    suffix = buf + ZUYAML_CORE_PREFIX_N;
+    if (strcmp(suffix, "str") == 0) {
+        return ZUYAML_TAG_STR;
+    }
+    if (strcmp(suffix, "int") == 0) {
+        return ZUYAML_TAG_INT;
+    }
+    if (strcmp(suffix, "float") == 0) {
+        return ZUYAML_TAG_FLOAT;
+    }
+    if (strcmp(suffix, "bool") == 0) {
+        return ZUYAML_TAG_BOOL;
+    }
+    if (strcmp(suffix, "null") == 0) {
+        return ZUYAML_TAG_NULL;
+    }
+    if (strcmp(suffix, "seq") == 0 || strcmp(suffix, "map") == 0) {
+        return ZUYAML_TAG_COLLECTION;
+    }
+    return ZUYAML_TAG_UNKNOWN;
+}
+
+/* The node's tag text, or NULL when it carries none. */
+static const char* node_tag(const cyaml_doc_t* doc, const cyaml_node_t* node,
+    uint32_t* len)
+{
+    *len = node->tag.len;
+    if (node->tag.len == 0) {
+        return NULL;
+    }
+    return cyaml_span_ptr(doc, node->tag);
+}
+
+/*
+ * Refuse an application tag when tags = "error".
+ *
+ * The default is to ignore it and convert the value normally. Erroring would
+ * reject a large amount of ordinary YAML -- more than twenty documents in the
+ * upstream test suite carry application tags and are perfectly valid -- so it
+ * is opt-in rather than the default. See the design's tags section.
+ */
+static void check_unknown_tag(zuyaml_ctx_t* ctx, const cyaml_node_t* node,
+    const char* tag, uint32_t tag_n)
+{
+    if (!ctx->tag_error) {
+        return;
+    }
+    {
+        /* Point at the tag the message names, not at the value it decorates.
+           A tag reaching here always has a span, but fall back to the node's
+           in case it ever does not. */
+        const cyaml_span_t* at = node->tag.start_line ? &node->tag
+                                                      : &node->span;
+        zuyaml_stopf("unsupported_tag", NULL,
+            "Unsupported YAML tag '%.*s' at line %u, column %u.",
+            (int)tag_n, tag, (unsigned)at->start_line,
+            (unsigned)at->start_col);
+    }
+}
+
+/*
+ * Classify a scalar with YAML 1.2 core schema rules.
+ *
+ * cyaml_scalar_kind() returns CYAML_KIND_STRING for every quoted scalar, which
+ * is exactly the distinction R needs: `""` stays "" and never becomes NULL.
+ * Note that cyaml_is_null_val() would be the wrong function here -- it treats
+ * an empty value as null, collapsing the quoted empty string.
+ */
+static SEXP convert_scalar(const cyaml_doc_t* doc, const cyaml_node_t* node,
+    zuyaml_ctx_t* ctx)
+{
+    uint32_t tag_n = 0;
+    const char* tag = node_tag(doc, node, &tag_n);
+
+    /* A tag overrides schema resolution. */
+    switch (classify_tag(doc, tag, (size_t)tag_n)) {
+    case ZUYAML_TAG_STR:
+        return scalar_string(doc, node);
+    case ZUYAML_TAG_INT:
+        return scalar_int(doc, node, ctx);
+    case ZUYAML_TAG_FLOAT:
+        return scalar_double(doc, node);
+    case ZUYAML_TAG_BOOL:
+        return scalar_bool(doc, node);
+    case ZUYAML_TAG_NULL:
+        return R_NilValue;
+    case ZUYAML_TAG_UNKNOWN:
+        check_unknown_tag(ctx, node, tag, tag_n);
+        break;
+    case ZUYAML_TAG_COLLECTION:
+    case ZUYAML_TAG_NONE:
+    default:
+        break;
+    }
+
+    /* Only *plain* scalars are resolved against the schema. Quoted, literal
+       and folded scalars are strings by construction, whatever their text
+       looks like. cyaml_scalar_kind() gets the quoted cases right but reports
+       an empty block scalar as null, so `key: >-` with no content would come
+       back as NULL instead of "". */
+    if (node->style != CYAML_PLAIN) {
+        return scalar_string(doc, node);
+    }
+
+    switch (cyaml_scalar_kind(doc, node)) {
+    case CYAML_KIND_NULL:
+        return R_NilValue;
+    case CYAML_KIND_BOOL:
+        return scalar_bool(doc, node);
+    case CYAML_KIND_INT:
+        return scalar_int(doc, node, ctx);
+    case CYAML_KIND_FLOAT:
+        return scalar_double(doc, node);
+    case CYAML_KIND_STRING:
+        return scalar_string(doc, node);
+    }
+
+    zuyaml_stopf("internal", NULL,
+        "Unexpected cyaml scalar kind. This is a bug in zuyaml.");
+}
+
+/* --- collections ------------------------------------------------------- */
+
+/*
+ * Collapse a list of length-one scalars of one type into an atomic vector.
+ *
+ * Only applied when simplify = TRUE, which is NOT the default: simplification
+ * makes the shape of the result depend on the contents of the document, so
+ * code that indexes the result is correct only for the inputs its author
+ * happened to test. See the design's sequence section.
+ */
+static SEXP maybe_simplify(SEXP list)
+{
+    R_xlen_t n = XLENGTH(list), i;
+    SEXPTYPE type = NILSXP;
+    SEXP out;
+
+    if (n == 0) {
+        return list; /* an empty sequence stays list() */
+    }
+
+    for (i = 0; i < n; i++) {
+        SEXP el = VECTOR_ELT(list, i);
+        SEXPTYPE et = TYPEOF(el);
+
+        if (el == R_NilValue || XLENGTH(el) != 1) {
+            return list;
+        }
+        if (et != LGLSXP && et != INTSXP && et != REALSXP && et != STRSXP) {
+            return list;
+        }
+        /* A classed element (zuyaml_bigint, later) is never simplified. */
+        if (Rf_getAttrib(el, R_ClassSymbol) != R_NilValue) {
+            return list;
+        }
+        if (i == 0) {
+            type = et;
+        } else if (et != type) {
+            return list;
+        }
+    }
+
+    out = PROTECT(Rf_allocVector(type, n));
+    for (i = 0; i < n; i++) {
+        SEXP el = VECTOR_ELT(list, i);
+        switch (type) {
+        case LGLSXP:
+            LOGICAL(out)[i] = LOGICAL(el)[0];
+            break;
+        case INTSXP:
+            INTEGER(out)[i] = INTEGER(el)[0];
+            break;
+        case REALSXP:
+            REAL(out)[i] = REAL(el)[0];
+            break;
+        case STRSXP:
+            SET_STRING_ELT(out, i, STRING_ELT(el, 0));
+            break;
+        default:
+            break;
+        }
+    }
+    UNPROTECT(1);
+    return out;
+}
+
+/*
+ * Is every element of this sequence a scalar in the *YAML* sense?
+ *
+ * The check has to be on node types, not on the converted R values: an inner
+ * sequence that simplified to a length-one vector would otherwise make its
+ * parent look like a scalar-only sequence, so [[1], [2]] would collapse to
+ * c(1L, 2L) and lose a level of structure.
+ */
+static bool seq_is_scalar_only(const cyaml_node_t* node)
+{
+    uint32_t n = cyaml_seq_len(node), i;
+
+    for (i = 0; i < n; i++) {
+        const cyaml_node_t* el = cyaml_seq_get(node, i);
+        if (el == NULL || el->type != CYAML_SCALAR) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static SEXP convert_seq(const cyaml_doc_t* doc, const cyaml_node_t* node,
+    zuyaml_ctx_t* ctx, const zuyaml_anc_t* anc)
+{
+    uint32_t n = cyaml_seq_len(node), i;
+    zuyaml_anc_t frame = { node, anc };
+    SEXP out;
+
+    /* The length is known up front, so the container is allocated once
+       rather than grown. */
+    out = PROTECT(Rf_allocVector(VECSXP, (R_xlen_t)n));
+    for (i = 0; i < n; i++) {
+        SET_VECTOR_ELT(out, (R_xlen_t)i,
+            zuyaml_convert_node(doc, cyaml_seq_get(node, i), ctx, &frame));
+    }
+
+    if (ctx->simplify && seq_is_scalar_only(node)) {
+        out = maybe_simplify(out);
+    }
+    UNPROTECT(1);
+    return out;
+}
+
+/*
+ * Follow an alias to the node it names.
+ *
+ * A key may be an alias -- `*anchor : value` is legal -- and what matters for
+ * deciding whether a mapping fits a named list is what the alias *resolves
+ * to*, not that it is an alias. Without this, one aliased key turned an
+ * ordinary mapping into a zuyaml_map.
+ *
+ * The step count bounds a cyclic chain; a cycle among keys is refused when the
+ * value side is converted.
+ */
+static const cyaml_node_t* follow_alias(const cyaml_node_t* n)
+{
+    int steps = 0;
+
+    while (n != NULL && n->type == CYAML_ALIAS && steps++ < 64) {
+        n = n->alias.target;
+    }
+    return n;
+}
+
+/*
+ * Text of a mapping key, as a CHARSXP. Callers ensure the key is a scalar.
+ *
+ * A key is stringified rather than converted, so it never passes through
+ * convert_scalar() and the tags policy has to be applied here: a caller who
+ * asked for tags = "error" wants to hear about `!duration 5m: v` just as much
+ * as about the same tag on the value side.
+ */
+static SEXP key_charsxp(const cyaml_doc_t* doc, const cyaml_node_t* key,
+    zuyaml_ctx_t* ctx)
+{
+    const cyaml_node_t* k = follow_alias(key);
+    uint32_t tag_n = 0;
+    const char* tag;
+
+    if (k != NULL) {
+        tag = node_tag(doc, k, &tag_n);
+        if (classify_tag(doc, tag, (size_t)tag_n) == ZUYAML_TAG_UNKNOWN) {
+            check_unknown_tag(ctx, k, tag, tag_n);
+        }
+    }
+    return scalar_charsxp(doc, k);
+}
+
+/*
+ * Can every key of this mapping become a unique R name?
+ *
+ * Scalar keys can, after stringification. A sequence- or mapping-valued key
+ * cannot, and coercing it into a name would silently destroy structure, so
+ * such a mapping is represented as a zuyaml_map instead.
+ */
+static bool map_keys_are_scalar(const cyaml_node_t* node)
+{
+    uint32_t n = cyaml_map_len(node), i;
+
+    for (i = 0; i < n; i++) {
+        const cyaml_pair_t* pair = cyaml_map_at(node, i);
+        const cyaml_node_t* key = pair ? follow_alias(pair->key) : NULL;
+
+        if (key == NULL || key->type != CYAML_SCALAR) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Mappings with collection-valued keys become a zuyaml_map: two parallel
+ * lists, chosen over a list of key/value pairs because both iteration and
+ * emission want keys and values separately.
+ *
+ * This is parse-only. cyaml_map_set() takes a null-terminated C string key and
+ * has no way to attach a key *node*, so such a mapping cannot be emitted; see
+ * the design's lossy-conversion table.
+ */
+static SEXP convert_complex_map(const cyaml_doc_t* doc,
+    const cyaml_node_t* node, zuyaml_ctx_t* ctx, const zuyaml_anc_t* anc)
+{
+    uint32_t n = cyaml_map_len(node), i;
+    zuyaml_anc_t frame = { node, anc };
+    SEXP keys, values, out, names, cls;
+
+    keys = PROTECT(Rf_allocVector(VECSXP, (R_xlen_t)n));
+    values = PROTECT(Rf_allocVector(VECSXP, (R_xlen_t)n));
+
+    for (i = 0; i < n; i++) {
+        const cyaml_pair_t* pair = cyaml_map_at(node, i);
+
+        SET_VECTOR_ELT(keys, (R_xlen_t)i,
+            zuyaml_convert_node(doc, pair->key, ctx, &frame));
+        SET_VECTOR_ELT(values, (R_xlen_t)i,
+            zuyaml_convert_node(doc, pair->val, ctx, &frame));
+    }
+
+    out = PROTECT(Rf_allocVector(VECSXP, 2));
+    SET_VECTOR_ELT(out, 0, keys);
+    SET_VECTOR_ELT(out, 1, values);
+
+    names = PROTECT(Rf_allocVector(STRSXP, 2));
+    SET_STRING_ELT(names, 0, Rf_mkChar("keys"));
+    SET_STRING_ELT(names, 1, Rf_mkChar("values"));
+    Rf_setAttrib(out, R_NamesSymbol, names);
+
+    cls = PROTECT(Rf_mkString("zuyaml_map"));
+    Rf_setAttrib(out, R_ClassSymbol, cls);
+
+    UNPROTECT(5);
+    return out;
+}
+
+static int cmp_cstr(const void* a, const void* b)
+{
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+/*
+ * Reject duplicate names.
+ *
+ * cyaml v0.1.3 advertises duplicate-key detection but never implements it --
+ * opts.dup_keys is declared in the header and read nowhere -- so this is
+ * zuyaml's own job. Sorting is O(n log n); the pairwise alternative would be
+ * quadratic on large mappings.
+ *
+ * This also catches collisions introduced by stringifying non-string scalar
+ * keys, where YAML saw two distinct keys (1 and "1") but R would see one name.
+ */
+static void check_unique_names(SEXP names)
+{
+    R_xlen_t n = XLENGTH(names), i;
+    const char** sorted;
+
+    if (n < 2) {
+        return;
+    }
+
+    /* R_alloc is released when the .Call returns, including on an unwind. */
+    sorted = (const char**)R_alloc((size_t)n, sizeof(const char*));
+    for (i = 0; i < n; i++) {
+        sorted[i] = CHAR(STRING_ELT(names, i));
+    }
+    qsort(sorted, (size_t)n, sizeof(const char*), cmp_cstr);
+
+    for (i = 1; i < n; i++) {
+        if (strcmp(sorted[i - 1], sorted[i]) == 0) {
+            zuyaml_stopf("duplicate_key", NULL,
+                "Duplicate mapping key '%s'; set duplicate_keys = TRUE to "
+                "allow duplicates.",
+                sorted[i]);
+        }
+    }
+}
+
+static SEXP convert_map(const cyaml_doc_t* doc, const cyaml_node_t* node,
+    zuyaml_ctx_t* ctx, const zuyaml_anc_t* anc)
+{
+    uint32_t n = cyaml_map_len(node), i;
+    zuyaml_anc_t frame = { node, anc };
+    SEXP out, names;
+
+    if (!map_keys_are_scalar(node)) {
+        return convert_complex_map(doc, node, ctx, anc);
+    }
+
+    out = PROTECT(Rf_allocVector(VECSXP, (R_xlen_t)n));
+    names = PROTECT(Rf_allocVector(STRSXP, (R_xlen_t)n));
+
+    for (i = 0; i < n; i++) {
+        cyaml_pair_t* pair = cyaml_map_at(node, i);
+
+        SET_STRING_ELT(names, (R_xlen_t)i, key_charsxp(doc, pair->key, ctx));
+        SET_VECTOR_ELT(out, (R_xlen_t)i,
+            zuyaml_convert_node(doc, pair->val, ctx, &frame));
+    }
+
+    if (!ctx->duplicate_keys) {
+        check_unique_names(names);
+    }
+    Rf_setAttrib(out, R_NamesSymbol, names);
+
+    UNPROTECT(2);
+    return out;
+}
+
+/*
+ * Convert one cyaml node to an R object.
+ *
+ * Dispatch covers every member of cyaml_type_t. CYAML_NONE marks an
+ * invalid/uninitialised node and should be unreachable from a successful
+ * parse, but it must not fall through silently -- a new upstream node type
+ * would otherwise be converted as whatever the default happened to be.
+ */
+/*
+ * Resolve an alias to the value of its target.
+ *
+ * cyaml populates node->alias.target during parsing (the composer sets it), so
+ * this needs neither cyaml_find_anchor() nor cyaml_resolve_aliases(). Avoiding
+ * the latter is the point: it replaces every alias with a *deep copy* of its
+ * target, in C, with no budget -- which is precisely how a billion-laughs
+ * payload turns 200 bytes of source into gigabytes of memory. Resolving here
+ * means every expanded node is charged against max_nodes and the conversion
+ * aborts as soon as the budget runs out.
+ */
+static SEXP convert_alias(const cyaml_doc_t* doc, const cyaml_node_t* node,
+    zuyaml_ctx_t* ctx, const zuyaml_anc_t* anc)
+{
+    const cyaml_node_t* target = node->alias.target;
+    const zuyaml_anc_t* a;
+
+    if (ctx->alias_error) {
+        zuyaml_stopf("alias", NULL,
+            "Document contains a YAML alias and aliases = \"error\".");
+    }
+    if (target == NULL) {
+        zuyaml_stopf("alias", NULL,
+            "YAML alias does not resolve to a known anchor.");
+    }
+
+    /* A target that is also an ancestor is a cycle. Following it would
+       recurse forever; R lists cannot represent it either. */
+    for (a = anc; a != NULL; a = a->parent) {
+        if (a->node == target) {
+            /* The composer fills in node->anchor for an alias but leaves
+               node->span zeroed, so the anchor span is the only position
+               available. */
+            const cyaml_span_t* at = node->anchor.start_line ? &node->anchor
+                                                             : &node->span;
+            if (at->start_line > 0) {
+                zuyaml_stopf("alias_cycle", NULL,
+                    "YAML alias cycle detected at line %u, column %u.",
+                    (unsigned)at->start_line, (unsigned)at->start_col);
+            }
+            zuyaml_stopf("alias_cycle", NULL,
+                "YAML alias cycle detected; aliases cannot refer to a node "
+                "that contains them.");
+        }
+    }
+
+    return zuyaml_convert_node(doc, target, ctx, anc);
+}
+
+SEXP zuyaml_convert_node(const cyaml_doc_t* doc, const cyaml_node_t* node,
+    zuyaml_ctx_t* ctx, const zuyaml_anc_t* anc)
+{
+    /* An empty document has no root. */
+    if (node == NULL) {
+        return R_NilValue;
+    }
+
+    /* Charge every materialised node against the budget. This is what bounds
+       alias expansion: max_depth and max_size do not, because a billion-laughs
+       payload is small and shallow. */
+    ctx->nodes += 1;
+    if (ctx->max_nodes > 0 && ctx->nodes > ctx->max_nodes) {
+        zuyaml_stopf("limit_nodes", NULL,
+            "Document exceeds the node limit (%.0f); see max_nodes.",
+            ctx->max_nodes);
+    }
+
+    switch (node->type) {
+    case CYAML_NULL: {
+        /* An empty node may still be tagged. `- !!str` with no content is the
+           empty string, and cyaml represents it as a null node, so the tag has
+           to be consulted before defaulting to NULL. */
+        uint32_t tag_n = 0;
+        const char* tag = node_tag(doc, node, &tag_n);
+
+        switch (classify_tag(doc, tag, (size_t)tag_n)) {
+        case ZUYAML_TAG_STR: {
+            /* Rf_ScalarString() allocates, so the CHARSXP needs an owner on
+               the protect stack first. */
+            SEXP ch = PROTECT(Rf_mkCharLenCE("", 0, CE_UTF8));
+            SEXP out = Rf_ScalarString(ch);
+            UNPROTECT(1);
+            return out;
+        }
+        case ZUYAML_TAG_UNKNOWN:
+            check_unknown_tag(ctx, node, tag, tag_n);
+            break;
+        default:
+            break;
+        }
+        return R_NilValue;
+    }
+
+    case CYAML_SCALAR:
+        return convert_scalar(doc, node, ctx);
+
+    case CYAML_SEQ:
+    case CYAML_MAP: {
+        SEXP out;
+
+        /* cyaml v0.1.3 never reads opts.max_depth, so the limit is enforced
+           here. Besides bounding hostile input, this is what keeps deeply
+           nested documents from exhausting R's protection stack during this
+           very recursion. */
+        if (ctx->max_depth > 0 && ctx->depth >= ctx->max_depth) {
+            zuyaml_stopf("limit_depth", NULL,
+                "YAML nesting exceeds max_depth (%u).",
+                (unsigned)ctx->max_depth);
+        }
+        {
+            uint32_t tag_n = 0;
+            const char* tag = node_tag(doc, node, &tag_n);
+            if (classify_tag(doc, tag, (size_t)tag_n) == ZUYAML_TAG_UNKNOWN) {
+                check_unknown_tag(ctx, node, tag, tag_n);
+            }
+        }
+        ctx->depth++;
+        out = (node->type == CYAML_SEQ) ? convert_seq(doc, node, ctx, anc)
+                                        : convert_map(doc, node, ctx, anc);
+        ctx->depth--;
+        return out;
+    }
+
+    case CYAML_ALIAS:
+        return convert_alias(doc, node, ctx, anc);
+
+    case CYAML_NONE:
+        break;
+    }
+
+    zuyaml_stopf("internal", NULL,
+        "Unexpected cyaml node type (%d). This is a bug in zuyaml.",
+        (int)node->type);
+}
