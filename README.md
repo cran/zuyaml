@@ -1,12 +1,13 @@
 # zuyaml
 
 <!-- badges: start -->
+[![CRAN status](https://www.r-pkg.org/badges/version/zuyaml)](https://CRAN.R-project.org/package=zuyaml)
 [![Lifecycle: experimental](https://img.shields.io/badge/lifecycle-experimental-orange.svg)](https://lifecycle.r-lib.org/articles/stages.html#experimental)
 [![R-CMD-check](https://github.com/pedrobtz/zuyaml/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/pedrobtz/zuyaml/actions/workflows/R-CMD-check.yaml)
 [![hardening](https://github.com/pedrobtz/zuyaml/actions/workflows/hardening.yaml/badge.svg)](https://github.com/pedrobtz/zuyaml/actions/workflows/hardening.yaml)
 [![native-checks](https://github.com/pedrobtz/zuyaml/actions/workflows/native-checks.yaml/badge.svg)](https://github.com/pedrobtz/zuyaml/actions/workflows/native-checks.yaml)
 [![pkgdown](https://github.com/pedrobtz/zuyaml/actions/workflows/pkgdown.yaml/badge.svg)](https://github.com/pedrobtz/zuyaml/actions/workflows/pkgdown.yaml)
-[![coverage](https://raw.githubusercontent.com/pedrobtz/zuyaml/main/.github/badges/coverage.svg)](https://github.com/pedrobtz/zuyaml/actions/workflows/coverage.yaml)
+[![coverage](https://raw.githubusercontent.com/pedrobtz/zuyaml/gh-pages/badges/coverage.svg)](https://github.com/pedrobtz/zuyaml/actions/workflows/coverage.yaml)
 <!-- badges: end -->
 
 zuyaml converts between YAML 1.2 and ordinary R objects, using a bundled copy of

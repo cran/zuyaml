@@ -1,19 +1,19 @@
 Package: zuyaml
-Title: Parse and Emit 'YAML' 1.2
-Version: 0.1.0
+Title: Parse and Emit YAML 1.2
+Version: 0.1.1
 Authors@R: c(
     person("Pedro", "Baltazar", , "pedrobtz@gmail.com",
            role = c("aut", "cre", "cph")),
     person("Andrew", "Sampson", role = c("ctb", "cph"),
            comment = "author of the bundled cyaml library")
   )
-Description: Converts between 'YAML' 1.2
+Description: Converts between YAML 1.2
     (<https://yaml.org/spec/1.2.2/>) and ordinary R objects using a bundled
     copy of the 'cyaml' C11 parser and emitter
     (<https://github.com/andrewmd5/cyaml>), so there is no system dependency
-    and no runtime dependency beyond R itself. Ambiguous 'YAML' features are
+    and no runtime dependency beyond R itself. Ambiguous YAML features are
     handled strictly and predictably: duplicate keys are refused by default,
-    the 'YAML' 1.2 core schema is followed so that yes and no resolve as
+    the YAML 1.2 core schema is followed so that yes and no resolve as
     strings, and integers beyond double precision are preserved rather than
     silently rounded. A stream of documents and a sequence are different
     things, and the interface keeps them apart. Input size, nesting depth
@@ -26,13 +26,14 @@ URL: https://github.com/pedrobtz/zuyaml,
 BugReports: https://github.com/pedrobtz/zuyaml/issues
 Encoding: UTF-8
 Language: en-GB
-RoxygenNote: 8.0.0
+LinkingTo: zufast
 Suggests: jsonlite, knitr, rmarkdown, testthat (>= 3.0.0), withr
 Config/testthat/edition: 3
+Config/roxygen2/version: 8.1.1
 NeedsCompilation: yes
-Packaged: 2026-09-18 12:59:06 UTC; pbtz
+Packaged: 2026-11-20 10:25:48 UTC; pbtz
 Author: Pedro Baltazar [aut, cre, cph],
   Andrew Sampson [ctb, cph] (author of the bundled cyaml library)
 Maintainer: Pedro Baltazar <pedrobtz@gmail.com>
 Repository: CRAN
-Date/Publication: 2026-10-07 16:50:02 UTC
+Date/Publication: 2026-11-20 10:50:02 UTC
